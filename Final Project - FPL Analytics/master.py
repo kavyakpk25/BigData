@@ -1,413 +1,460 @@
+#!usr/local/python3
 from pyspark import SparkConf, SparkContext
-from pyspark.streaming import StreamingContext 
+from pyspark.streaming import StreamingContext
 from pyspark.sql import Row, SQLContext
 import sys
 import json
-
-
-
-
-#setMaster("local")
-sc = SparkContext("local[2]", "FPL-notfromninad")
-sqlContext = SQLContext(sc)
-ssc = StreamingContext(sc, 1)
-#df = ssc.read.csv('hdfs://localhost:9000/Input/players.csv', header = True)
-#df2 = ssc.read.csv('hdfs://localhost:9000/Input/teams.csv', header = True)
-match_details=dict()
-chemistry=dict()
-lines = ssc.socketTextStream("localhost", 6100)
-
-#words = lines.foreachRDD(lambda c: c["eventId"])
-
+from pyspark.sql import SparkSession
+from functools import partial
+import subprocess
+import simplejson
+import re
+import pyspark.sql.functions as F
+#from pyspark.sql.functions import when
+#from pyspark.sql.functions import lit
 def new_player(team):
 			player=dict()
-			player["pass_accuracy"]=0
-			player["duel_effectiveness"]=0
-			player["free_kick_effectiveness"]=0
-			player["shot_effectiveness"]=0
+			player["t_and_goal"]=0
+			player["t_an_nogoal"]=0
+			player["total_shots"]=0
+			player["accurate_normal_pass"]=0
+			player["accurate_key_pass"]=0
+			player["normal_pass"]=0
+			player["key_pass"]=0
 			player["fouls"]=0
 			player["own_goal"]=0
 			player["team"]=team
-			player["PLAYER_CONTRIB"]=0
-			player["PLAYER_PERF"]=0
-			player["BENCHED"]=0
-			player["PLAYER_RATING"]=0.5
-			player["CHANGE"]=0.5
-			player['Time']=90
+			player["duels_won"]=0
+			player["neutral_duels"]=0
+			player["total_duels"]=0
+			player["effective_free_kicks"]=0
+			player["penalties_scored"]=0
+			player["total_free_kicks"]=0
 			return player
+
 def new_match(events):
-			match_Id=events['wyId']
-			for team in events['teamsData']:
-				print()
-				print("NEW MATCH CREATED !!!!!!!!!!!")
-				print()
-				benched_players=events['teamsData'][team]['formation']['bench']
-				
-				match_details[match_Id]['team'][team]=events['teamsData'][team]['formation']['substitutions']
-				#I THINK THIS MIGHT BE WRONG
-				for pl in benched_players:
-					pl_Id=pl['playerId']
-					match_details[match_Id][pl_Id]=new_player(team)
-					match_details[match_Id][pl_Id]['BENCHED']=1
-					match_details[match_Id][pl_Id]['Time']=0
-			print("NEW MATCH_DETAILS IN SUBPROCESS !!!!!!!!!!!",match_details)
+		#match_details={playerId,matchId,team,time},{}
+		#MATCH_PROFILE={matchId:,date,duration,winner,venue,gameweek,red,yellow,goal,own_goal}
+        spark2 = SparkSession.builder.appName('abc').getOrCreate()
+        match_Id=events['wyId']
+        MATCH_PROFILE=dict()
+        MATCH_PROFILE['matchId']=events['wyId']
+        MATCH_PROFILE['date']=str(events['dateutc'])
+        MATCH_PROFILE['duration']=events['duration']
+        winner= events["winner"]
+        if(winner==0):
+                winner=None
+        MATCH_PROFILE['winner']=winner
+        MATCH_PROFILE['venue']=events["venue"]
+        MATCH_PROFILE['gameweek']=events["gameweek"]
+        players=[]
+        yellow_card_players=[]
+        red_card_players=[]
+        own_goals_list=[]
+        goals_list=[]
+        match_details=dict()
+        if(events['duration']=='Regular'):
+                ft=90
+        else:
+                ft=120
+        for team in events['teamsData']:
+                benched_players=events['teamsData'][team]['formation']['bench']
+                substitutions=events['teamsData'][team]['formation']['substitutions']
+                players=[i for i in events['teamsData'][team]['formation']['bench']]
+                
+                players.extend(events['teamsData'][team]['formation']['lineup'])
+                for sub in substitutions:
+                        IN=sub['playerIn']
+                        Out=sub['playerOut']
+                        time=0
+                        if IN not in match_details:
+                                match_details[IN]=dict()
+                                match_details[IN]['matchId']=match_Id
+                                match_details[IN]['team']=team
+                                match_details[IN]['playerId']=IN
+                                match_details[IN]['Time']=0
+                        if Out not in match_details:
+                                match_details[Out]=dict()
+                                match_details[Out]['matchId']=match_Id
+                                match_details[Out]['team']=team
+                                match_details[Out]['playerId']=Out
+                                match_details[Out]['Time']=0
+                subs=[]
+                for i in substitutions:
+                        subs.append(i)
+                final_subs=[]
+                for i in subs:
+                        final_subs.append([i['playerIn'],i['minute'],"in"])
+                        final_subs.append([i["playerOut"],i["minute"],"out"])
+                final_subs= sorted(final_subs, key = lambda x: (x[0], x[1]))
+				#CALCULTING PLAY TIME FOR SUBSTITUTED PLAYERS
+                for i in final_subs:
+                        plid=i[0]
+                        if match_details[plid]["Time"]==0:
+                                if(i[2]=="out"):
+                                        match_details[plid]["Time"]+=i[1]
+                                else:
+                                        match_details[plid]["Time"]+=(ft-i[1])
+                        else:
+                                if(i[2]=="in"):
+                                        match_details[plid]["Time"]+=(ft-i[1])
+                                if(i[2]=="out"):
+                                        match_details[plid]["Time"]-=(ft-i[1])
+				#ADDING BENCHED PLAYERS TO THE PLERS OF THAT MATCH
+                for pl in benched_players:
+                        
+                        pl_Id=pl['playerId']
+                        if pl_Id not in match_details:
+                                match_details[pl_Id]=dict()
+                                match_details[pl_Id]['matchId']=match_Id
+                                match_details[pl_Id]['playerId']=pl_Id
+                                match_details[pl_Id]['Time']=0
+                                match_details[pl_Id]['team']=team
+				#UPDATING MATCH_PROFILE
+                for i in players:
+                        if(i['redCards']!=0):
+                                red_card_players.append(i['playerId'])
+                        if(i['yellowCards']!=0):
+                                yellow_card_players.append(i['playerId'])
+                        if(i['goals']!=0):
+                                goals_list.append((i['playerId'],team,i['goals']))
+                        if(i['ownGoals']!=0):
+                                own_goals_list.append((i['playerId'],team,i['goals']))
+        MATCH_PROFILE['yellowcards']=yellow_card_players
+        MATCH_PROFILE['redcards']=red_card_players
+        MATCH_PROFILE['goals']=goals_list
+        MATCH_PROFILE['owngoals']=own_goals_list
+        
+        
+        
+        json_match = json.dumps(MATCH_PROFILE)
+        
+        with open("sample.json", "w") as outfile:
+        	outfile.write(json_match)
+        #print()
+        #print("*******************")
+        #print("MATCH PROFILE COLUMN NAMES", MATCH_PROFILE.schema.names)
+        #print("*********************")
+        #df2=spark2.createDataFrame([MATCH_PROFILE])
+        #names = df2.schema.names
+        #for name in names:
+        #	print(name , 'NULL COUNT: ' , df2.where(df2[name].isNull()).count())
+        #	print(name , 'NOT NULL COUNT: ' , df2.where(df2[name].isNotNull()).count())
+        
+        #df2.toJSON().saveAsTextFile("hdfs://localhost:9000/matches/"+str(match_Id)+".json")
+        #df2.repartition(1).write.json(path='hdfs://localhost:9000/SPARK/match_profiles.json', mode="append")
+        
+        #df2.repartition(1).write.mode('append').json('hdfs://localhost:9000/SPARK/match_profiles.json')
+        #json_match.repartition(1).write.mode('append').json('hdfs://localhost:9000/SPARK/match_profiles.json')
+	        #OBTAINING A LIST OF DICTIONARY OF SUB AND BENCHED PLAYER
+        l=[]
+        for i in match_details:
+                l.append(match_details[i])
+        return l
+###################################################################################################
 
-#{match ={player1:{},player2:{}}}######################################################
-def create_data(a):
-	print("IN CREATE DATA")
+def sub_process_event(a,player):
+
 	events = json.loads(a)
 	if 'eventId' in events.keys():
-		match_Id=events['matchId']
-		player_Id=events['playerId']
-		
-		if match_Id not in match_details:
-			match_details[match_Id]=dict()
-			match_details[match_Id]['team']=dict()
-		if player_Id not in match_details[match_Id]:
-			player=new_player(events['teamId'])
-			match_details[match_Id][player_Id]=player
-		
-		subprocess(a,match_details[match_Id][player_Id])
-	if 'wyId' in events.keys():
-		print("NEW MATCH_DETAILS IN SUBPROCESS !!!!!!!!!!!",match_details)
-		match_Id=events['wyId']
-		
-		if match_Id not in match_details:
-			match_details[match_Id]=dict()
-			match_details[match_Id]['team']=dict()
-			
-		new_match(events)
-			
-			
-	player_statistics(match_details)
-				
-	
-					
-				
-			
-					
-				
-		
-		
-		
-########################################################################################################	
 
-def subprocess(a,player):
-	print("IN SUBPROCESS")
-	events = json.loads(a)
-	if 'eventId' in events.keys():
-		pass_accuracy=0
-		duel_effectiveness=0
-		free_kick_effectiveness=0
-		shot_effectiveness=0
-		fouls=0
-		own_goal=0
 		match_Id=events['matchId']
 		player_Id=events['playerId']
-		j = [x['id'] for x in events['tags']]
+		tags = [x['id'] for x in events['tags']]
 		if(events['eventId'] == 8):
-			pass_accuracy = 0  
+
 			if(len(events['tags']) > 0):
-				accurate_normal_passes = 0
-				accurate_key_passes = 0
-				normal_passes = 0
+				player["accurate_normal_pass"] = 0
+
+				player["normal_pass"] = 0
 				key_passes = 0
 
-				if 1801 in j:
-					accurate_normal_passes += 1
-					normal_passes += 1
-				if 1802 in j:
-					normal_passes += 1
-				if 302 in j and 1801 in j:
-					accurate_key_passes += 1
-				if 302 in j:
-					key_passes += 1
-				#PASS ACCURACY
-				pass_accuracy = (accurate_normal_passes+(accurate_key_passes*2))/(normal_passes + (key_passes*2))	
-			if(events['eventId'] == 1):
-				if(len(events['tags']) > 0):
-					duel_won = 0
-					neutral_duels = 0
-					total_duels = 0
-					if 702 in j:
-						neutral_duels += 1
-						total_duels += 1
-					if 703 in j:
-						duel_won += 1	
-						total_duels += 1
-					if 701 in j:
-						total_duels += 1
-					#duel_effectiveness
-					duel_effectiveness = (duels_won + neutral_duels*0.5)/(total_duels)
-			if(events['eventId'] == 3):
-				if(len(events['tags']) > 0):
-					effective_freekicks  = 0
-					total_freekicks = 0
-					penalty_scored 
-					 
-					if 1801 in j:
-						 effective_freekicks+=1
-						 total_freekicks += 1
-					if 1802 in j:
-						total_freekicks += 1	 
-					if(events['subEventId'] == 35):
-						if 101 in j:
-							penalty_scored += 1
-					#free_kick_effectiveness
-					free_kick_effectiveness = (effective_freekicks + penalty_scored)/total_freekicks	
-			if(events['eventId'] == 10):
-				shot_effectiveness = 0
+				if 1801 in tags:
+					player["accurate_normal_pass"] += 1
+					player["normal_pass"] += 1
+				if 1802 in tags:
+					player["normal_pass"] += 1
+				if 302 in tags and 1801 in tags:
+					player["accurate_key_pass"] += 1
+				if 302 in tags:
+					player["key_pass"] += 1
+
+		if(events['eventId'] == 1):
 			if(len(events['tags']) > 0):
-				t_and_goal = 0
-				t_an_nogoal= 0
-				total_shots= 0
+				player["duels_won"] = 0
+				player["neutral_duels"]= 0
+				total_duels = 0
+				if 702 in tags:
+					player["neutral_duels"] += 1
+					player['total_duels'] += 1
+				if 703 in tags:
+					player["duels_won"] += 1
+					player["total_duels"] += 1
+				if 701 in tags:
+					player["total_duels"] += 1
 
-				if 1801 in j and 101 in j:
-					t_and_goal += 1
-					total_shots += 1
-				elif 1801 in j :
-					t_an_nogoal += 1
-					total_shots += 1
-				elif 1802 in j:
-					total_shots += 1
-				#shot_effectiveness
-				shot_effectiveness = (t_and_goal+t_an_nogoal*0.5 )/total_shots
-			fouls = 0
-			own_goal=0	
-			if(events['eventId'] == 2):
-				fouls+=1
-			if(102 in j):
-				own_goal+=1
-			player["pass_accuracy"]=pass_accuracy
-			player["duel_effectiveness"]=duel_effectiveness
-			player["free_kick_effectiveness"]=free_kick_effectiveness
-			player["shot_effectiveness"]=shot_effectiveness
-			player["fouls"]=fouls
-			player["own_goal"]=own_goal
-			print("MATCH_DETAILS IN SUBPROCESS !!!!!!!!!!!",match_details)
-				
-				
-						
-							
-						 
-				
-						
+		if(events['eventId'] == 3):
+			if(len(events['tags']) > 0):
+				player["effective_free_kicks"]  = 0
+				total_freekicks = 0
 
-#match_details{match1:{1:{},2:{},'team':{ist team:[substitions]}}}
-#####PLAYER CONTRIBUTION##############
-def player_statistics(match_details):
-	for match in match_details:
-		SUB_PLAYERS=list()
-		if(len(match_details[match]['team']) > 0):
-			for team in match_details[match]['team']:
-				all_sub=match_details[match]['team'][team]
-				for sub in all_sub:
-					In=sub['playerIn']
-					Out=sub['playerOut']
-					
-					#suppose adding them now
-					if In not in match_details[match]:
-						player=new_player(team)
-						match_details[match][In]=player
-						match_details[match][In]['Time']=0
-					if Out not in match_details[match]:
-						player=new_player(team)
-						match_details[match][Out]=player
-						match_details[match][Out]['Time']=0
-					SUB_PLAYERS.append(In)
-					SUB_PLAYERS.append(Out)
-					match_Id=match	
-					#in	
-					if match_details[match_Id][In]["Time"]==0:
-						match_details[match_Id][In]["BENCHED"]=1
-						match_details[match_Id][In]["Time"]=90-sub['minute']
-					else:
-						match_details[match_Id][In]["BENCHED"]=1
-						match_details[match_Id][In]["Time"]+=90-sub['minute']
-					#out
-					if match_details[match_Id][Out]["Time"]==90:
-						match_details[match_Id][Out]["Time"]=sub['minute']
-					else:
-						match_details[match_Id][Out]["Time"]-=90-sub['minute']
-			
-			for player in match_details[match]:
-				if player != 'team':	
-					match_details[match][player]["PLAYER_CONTRIB"]=(match_details[match][player]["pass_accuracy"]+match_details[match][player]["duel_effectiveness"]+match_details[match][player]["free_kick_effectiveness"]+match_details[match][player]["shot_effectiveness"])/4
-			
-					if player not in SUB_PLAYERS:
-						match_details[match][player]["PLAYER_CONTRIB"]*=1.05
-					else:
-						match_details[match][player]["PLAYER_CONTRIB"]*=match_details[match][player]["Time"]/90
-				
-					if match_details[match][player]['BENCHED']:
-						match_details[match][player]["PLAYER_CONTRIB"]=0
-			
-				#Player	performance
-					CONTRIBUTION=match_details[match][player]["PLAYER_CONTRIB"]
-					match_details[match][player]["PLAYER_PERF"]=CONTRIBUTION-match_details[match][player]["fouls"]*0.005
-					match_details[match][player]["PLAYER_PERF"]=CONTRIBUTION+match_details[match][player]["own_goal"]*0.05
-					#Player	Rating
-					z=match_details[match][player]["PLAYER_RATING"]
-					
-					match_details[match][player]["PLAYER_RATING"]=(match_details[match][player]["PLAYER_PERF"]+match_details[match][player]["PLAYER_RATING"])/2
-					match_details[match][player]["CHANGE"]=match_details[match][player]["PLAYER_RATING"]-z
-		#CHEMISTRY		
-		for player in match_details[match] :	
-			if player != 'team':
-				player1_team=match_details[match][player]["team"]
-				for player2 in match_details[match] :
-					if player != 'team':
-						if tuple(sorted((int(player),int(player2)))) not in chemistry:
-							chemistry[tuple(sorted((int(player),int(player2))))]=0.5
-						key=tuple(sorted((int(player),int(player2))))
-						avg=abs(match_details[match][player]["CHANGE"]+match_details[match][player2]["CHANGE"])*0.5
-						if match_details[match][player2]["team"] != player1_team:
-							
-							if ((match_details[match][player]["CHANGE"] > 0 and match_details[match][player2]["CHANGE"]> 0) or (match_details[match][player]["CHANGE"] > 0 and match_details[match][player2]["CHANGE"]< 0)):
-								chemistry[key]-=avg
-							else:
-								chemistry[key]+=avg
-						else:
-							if ((match_details[match][player]["CHANGE"] > 0 and match_details[match][player2]["CHANGE"]> 0) or (match_details[match][player]["CHANGE"] > 0 and match_details[match][player2]["CHANGE"]< 0)):
-								chemistry[key]+=avg
-							else:
-								chemistry[key]-=avg
-				print()
-				print("CHEMISTRY   ",chemistry)
-				print()
+
+				if 1801 in tags:
+					 player["effective_free_kicks"]+=1
+					 player["total_free_kicks"] += 1
+				if 1802 in tags:
+					player["total_free_kicks"] += 1
+				if(events['subEventId'] == 35):
+					if 101 in tags:
+						player["penalties_scored"] += 1
+
+		if(events['eventId'] == 10):
+			shot_effectiveness = 0
+			if(len(events['tags']) > 0):
+
+
+				if 1801 in tags and 101 in tags:
+					player["t_and_goal"] += 1
+					player["total_shots"] += 1
+				elif 1801 in tags :
+					player["t_an_nogoal"] += 1
+					player["total_shots"] += 1
+				elif 1802 in tags:
+					player["total_shots"] += 1
+
+
+		if(events['eventId'] == 2):
+			player["fouls"]+=1
+		if(102 in tags):
+			player["own_goal"]+=1
+
+
 ##########################################################################
-from pyspark.ml.clustering import KMeans
-from pyspark.ml.evaluation import ClusteringEvaluator
-from pyspark.ml.feature import VectorAssembler
-player["pass_accuracy"]=0
-			player["duel_effectiveness"]=0
-			player["free_kick_effectiveness"]=0
-			player["shot_effectiveness"]=0
-			player["fouls"]=0
-			player["own_goal"]=0
-			player["team"]=team
-			player["PLAYER_CONTRIB"]=0
-			player["PLAYER_PERF"]=0
-			player["BENCHED"]=0
-			player["PLAYER_RATING"]=0.5
-			player["CHANGE"]=0.5
-			player['Time']=90
-#df = ssc.read.csv('hdfs://localhost:9000/SPARK/players.csv', header = True)
-df2 = sc.read.format('csv').option('header',True).option('multiLine', True).load('hdfs://localhost:9000/SPARK/players.csv')
-player_profile=dict()
-total_matches=len(match_details)
+def create_data(a):
+	events = json.loads(a)
+	#IF EVENT RECORD
+	if 'eventId' in events.keys():
+		match_Id=events['matchId']
+		player_Id=events['playerId']
+		row=new_player(events['teamId'])
+		row['playerId']=player_Id
+		row["matchId"]=events['matchId']
+		sub_process_event(a,row)
+	#IF MATCH RECORD
+	if 'wyId' in events.keys():
+		row=new_match(events)
+		#print("I AM A ROWWW",row,type(row))
 
-for match in match_details:
-	for player in match:
-		if player != 'team':
-			if player not in player_profile:
-				player_profile[player]=dict()
-			player_profile[player]['Id']=player
-			player_profile[player]['Number of Fouls']+=match_details[match][player]["fouls"]
-			player_profile[player]['Number of Goals']+=match_details[match][player]["own_goal"]
-			player_profile[player]['Pass Accuracy']+=match_details[match][player]["pass_accuracy"]
-			player_profile[player]['Number of Fouls']+=match_details[match][player]["fouls"]
-			player_profile[player]['Shots on target']+=match_details[match][player]["shot_effectiveness"]
-			player_profile[player]['Rating']+=match_details[match][player]["PLAYER_RATING"]
-			player_profile[player]['Total_Matches']+=1
-			if player["BENCHED"]:
-				player_profile[player]['Total_Benches']+=1
-			count=0
-			for i in chemistry:
-				for player in i:
-					player_profile[player]['Chemistry']+=chemistry[i]
-					count+=1
-			player_profile[player]['Chemistry']/=count
-					
-kmeans_players=list()
-for player in player_profile:
-	if player_profile[player]['Total_Matches'] < 5:
-		player_profile[player]['Rating']/=player_profile[player]['Total_Matches']
-		
-		kmeans_player.append(player_profile[player])
-		
-df1 = spark.createDataFrame(kmeans_players)
-df = df1.join(df2, on = ['Id'], how = "inner")	
-vecAssembler = VectorAssembler(inputCols=['Id','Number of Fouls','Number of Goals','Pass Accuracy','Number of Fouls','Shots on target','name','birthArea','birthDate','foot','role','height','passportArea','weight','Chemistry','Rating'], outputCol="features")
-new_df = vecAssembler.transform(df)
-kmeans = KMeans(k=5, seed=1)  # 5 clusters here
-model = kmeans.fit(new_df.select('features'))
-predictions = model.transform(new_df)
-centers = model.clusterCenters()
-print("Cluster Centers: ")
-for center in centers:
-    print(center)
-##############################################################################################################		
+	return row
+
+########################################################################################################
+def chemistry_coeff(df):
+        #spark1 = SparkSession.builder.appName('abc').getOrCreate()
+        matches = df.select("matchId").distinct().rdd.flatMap(lambda x: x).collect()
+        for matchId in matches:
+                df_filtered=df.filter(df.matchId==matchId)
+                d=dict()
+                for player in df_filtered.rdd.collect():
+                        for player2 in df_filtered.rdd.collect():
+                                p1=player.__getitem__("playerId")
+                                p2=player2.__getitem__("playerId")
+                                t1=player.__getitem__("team")
+                                t2=player2.__getitem__("team")
+                                c1=player.__getitem__("CHANGE")
+                                c2=player2.__getitem__("CHANGE")
+                                if((p1,p2) not in d and (p2,p1) not in d and p1!=p2):
+                                        d[(p1,p2)]=[0.5,t1,t2,c1,c2]
+                for x in d:
+                        t1=d[x][1]
+                        t2=d[x][2]
+                        c1=d[x][3]
+                        c2=d[x][4]
+                        avg1=(abs(c1)+abs(c2))/2
+                        if(t1==t2):
+                                if((c1>0 and c2>0) or (c1<0 and c2<0)):
+                                        d[x][0]+=avg1
+                                else:
+                                        d[x][0]-=avg1
+                        else:
+                                if((c1>0 and c2>0) or (c1<0 and c2<0)):
+                                        d[x][0]-=avg1
+                                else:
+                                        d[x][0]+=avg1
+
+                l=[]
+                for x in d:
+                        final_dict=dict()
+                        final_dict["player1"]=x[0]
+                        final_dict["player2"]=x[1]
+                        final_dict["chemistry"]=d[x][0]
+                        final_dict["matchId"]=matchId
+                        l.append(final_dict)
+                #print(l)
+                return(l)
+
+
+##########################################################################################
+def player_statistics(player,match):
+        #spark1 = SparkSession.builder.appName('abc').getOrCreate()
+        df2=player.groupby("matchId","playerId","team").sum("t_and_goal","t_an_nogoal","total_shots","accurate_normal_pass","normal_pass","key_pass","fouls","own_goal","duels_won","neutral_duels","total_duels","effective_free_kicks","penalties_scored","total_free_kicks")
+
+        player=rename_columns_after_any_aggregation(df2)
+
+        player= player.withColumn("pass_accuracy", F.when((F.col("normal_pass") + F.col("key_pass")*2)!=0,((F.col("accurate_normal_pass")+(F.col("key_pass")*2))/(F.col("normal_pass") + F.col("key_pass")*2))).otherwise(F.lit(0)))
+        player= player.withColumn("duel_effectiveness", (F.col("duels_won")+F.col("neutral_duels")*0.5)/(F.col("total_duels")))
+        player= player.withColumn("free_kick_effectiveness", (F.col("effective_free_kicks")+F.col("penalties_scored"))/(F.col("total_free_kicks")))
+        player= player.withColumn("shot_effectiveness", (F.col("t_and_goal")+(F.col("t_an_nogoal")*0.5))/(F.col("total_free_kicks")))
+        #player_contrib
+        print("****************************1")
+        print("CONTRIBUTION")
+        print("*******************************")
+        player=player.join(match,on=["matchId","playerId","team"],how="left")
+        player=player.fillna(90, subset=['Time'])
+        player= player.withColumn("CONTRIBUTION", ((F.col("pass_accuracy")+F.col("duel_effectiveness")+F.col("free_kick_effectiveness")+F.col("shot_effectiveness"))/4))
+        player=player.withColumn("CONTRIBUTION", F.when(F.col("time") == 90,F.col("CONTRIBUTION")*1.05).otherwise(F.col("CONTRIBUTION")*F.col("time")/90))
+        player=player.withColumn("PERFORMANCE", F.col("CONTRIBUTION")-0.05*F.col("fouls")-0.005*F.col("own_goal"))
+        player=player.fillna(0)
+        print("**************************2")
+        print("PERFORMANCE DONE")
+        print("*****************************")
+        #on forums it says 10%
+        #player rating
+        #our assumtion id matchId is sequential=>check if it is sequential
+         
+        
+        player=player.withColumn("CHANGE", F.lit(0))
+        player = player.sort(F.col("matchId").asc())
+        prev_mid = player.rdd.collect()[0].__getitem__("matchId")
+        #player_data = player.rdd.collect()
+        #player_rating = player.groupby("playerId").avg("RATING")
+        p_r = dict()
+        print("********************************3")
+        print("BEFORE FOR LOOP")
+        print("**********************")
+        i = 0
+        #list_players = player.select("playerId").distinct().rdd.flatMap(lambda x: x).collect()
+	#for pid in list_records:
+	#	df_filtered=df.filter(df.playerId==pid)
+        #player.groupby("playerId").avg("foul", "own_goal", "pass_accuracy", "shot_effectiveness")
+        for row in player.rdd.collect():
+        	
+                #__getitem__
+                pid = row.__getitem__("playerId")
+                print("PID", pid)
+                print("I", i)
+                mid = row.__getitem__("matchId")
+                team = row.__getitem__("team")
+                if pid not in p_r.keys():
+                        p_r[pid]=dict()
+                        #p_r[pid]["CHANGE1"] = 0
+                        p_r[pid]["playerId"] = pid
+                        p_r[pid]["RATING"] = 0.5
+
+                old_rating = p_r[pid]["RATING"]
+                p_r[pid]["RATING"] = (p_r[pid]["RATING"] + row.__getitem__("PERFORMANCE"))/2
+                new_rating = p_r[pid]["RATING"]
+                change = new_rating - old_rating
+                print("CHANGE", change)
+                #p_r[pid]["CHANGE1"]=change               
+                player=player.withColumn("CHANGE", F.when((F.col("matchId") == mid) & (F.col("team") == team) & (F.col("playerId") == pid),change).otherwise(F.col("CHANGE")))
+                i = i+1
+
+        #WRITING THE FINAL COMPUTED METRICS
+        list_df = [x for x in p_r.values()]
+        
+        return(player,list_df)
+        
+##########################################################################
+def convert_to_dictionary(a,match_details):
+        print(type(a))
+        a = a.replace("\'", "\"")
+        match_details.update(simplejson.loads(a))
+        return match_details
+
+
+############################################################################################################
+def rename_columns_after_any_aggregation(df):
+    for name in df.schema.names:
+        clear_name = ''
+        m = re.search('\((.*?)\)', name)
+        if m:
+            clear_name = m.group(1)
+            df = df.withColumnRenamed(name, clear_name)
+
+    return df
+##########################################################################
+count=0
 def process(rdd):
-	if(not rdd.isEmpty()):
-		tf = sc.textFile('hdfs://localhost:9000/SPARK/rec.json',2000)
-		print("PROPERLY READ")
-		data = tf.map(lambda x: json.loads(x))
-		match_details = data.collect()
-		print("THIS IS WHAT I GOT FROM HADOOP",type(match_details))
-		rdd.foreach(create_data)
-		rdd.cache()
-		print()
-		print("CHEMISTRY AFTER A DSTREAM   ",chemistry)
-		print()
-		spark.read.json(sc.parallelize([match_details])).coalesce(1).write.json('hdfs://localhost:9000/SPARK/rec.json')
-		print("PROPERLY WRITTEN")	
-		print()
-		print("MATCH DETAILS LENGTH ",len(match_details))
-		#print("MATCH DETAILS",match_details)		
-		
-		
+        if(not rdd.isEmpty()):
+                global count
+                spark = SparkSession.builder.appName('abc').getOrCreate()
+                count+=1
+                match_details=dict()
+                match_rdd=rdd.map(lambda j: create_data(j))
+                last_rdd=(match_rdd.take(match_rdd.count()))
+
+                event_list=[]
+                match_list=[]
+                for i in last_rdd:
+                        if not isinstance(i, dict):
+                                match_list.extend(i)
+                        else:
+                                event_list.append(i)
+                if(len(event_list)>0):
+                        df = spark.createDataFrame(event_list)
+                        df_events=df.groupby("matchId","playerId","team").sum("t_and_goal","t_an_nogoal","total_shots","accurate_normal_pass","normal_pass","key_pass","fouls","own_goal","duels_won","neutral_duels","total_duels","effective_free_kicks","penalties_scored","total_free_kicks")
+                        df_events=rename_columns_after_any_aggregation(df_events)
+                        df_events.show()
+                        if(count==1):
+                                df_events.repartition(1).write.csv(path='hdfs://localhost:9000/SPARK/events.csv',header=True)
+                        else:
+                                df_events.repartition(1).write.csv(path='hdfs://localhost:9000/SPARK/events.csv', mode="append")
+                if(len(match_list)>0):
+                        df_MATCH = spark.createDataFrame(match_list)
+                        if(count==1):
+                                df_MATCH.repartition(1).write.csv("hdfs://localhost:9000/SPARK/match.csv",header = True)
+                        else:
+                                df_MATCH.repartition(1).write.csv("hdfs://localhost:9000/SPARK/match.csv", mode="append")
+
+                #print("Count of fouls")
+                #count_df=df_load.groupby("matchId").sum("fouls","own_goal")
+                #df_load = spark.read.csv('hdfs://localhost:9000/SPARK/events.csv')
+                #print("SHAPE 2", df_load.count())
+                #df_load = spark.read.csv('hdfs://localhost:9000/SPARK/match.csv')
+                #print("SHAPE 1", df_load.count())
+
+
+if(__name__=="__main__"):
+	#setMaster("local")
+	sc = SparkContext("local[2]", "Football Premier League - Analysis")
+	sqlContext = SQLContext(sc)
+	ssc = StreamingContext(sc, 1)
+	#df = ssc.read.csv('hdfs://localhost:9000/Input/players.csv', header = True)
+	#df2 = ssc.read.csv('hdfs://localhost:9000/Input/teams.csv', header = True)
+	#lines = ssc.socketTextStream("localhost", 6100)
+	#lines.foreachRDD(lambda c: process(c))
+	spark = SparkSession.builder.appName('abc').getOrCreate()
+	df_load_events = spark.read.csv('hdfs://localhost:9000/SPARK/events.csv',inferSchema=True,header=True)
+	print("Events: ")
+	df_load_events.show()
+	print(df_load_events.schema)
+	df_load_match = spark.read.csv('hdfs://localhost:9000/SPARK/match.csv',inferSchema=True,header=True)
+	print("Matches: ")
+	df_load_match.show()
+	print(df_load_match.schema)
 	
-lines.foreachRDD(lambda c: process(c))
-
-#df = sqlContext.read.json('rec.json')
-
-#my_RDD_strings = sc.textFile('rec.json')
-#my_RDD_dictionaries = my_RDD_strings.map(json.loads)
-#print(my_RDD_dictionaries)
-
-#df=json.loads(df)
-def print_rdd(a):
-	print("NEW !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",i)
-
-   	
-
-print()
-print()
-#print(type(lines))
-print()
-print()
-#data = json.loads(lines)
-
-#rint(df)
-#recong_event = 'eventId'
-##if recog_event in data.keys():
-#lines.pprint()
-ssc.start()
-ssc.awaitTermination() 
-
-##### UI
-import sys
-import json
-
-print("MENU")
-print("\n\n\n\n\n")
-print("1. Predict winning chances of 2 teams\n")
-print("2. Display Player Profile\n")
-print("3. Display Match Details\n")
-
-print("Enter your choice: ")
-case=int(input())
-if case==1:
-	path=input("Enter the complete file path: ")
-elif case==2:
-	path=input("Enter the complete file path: ")
-elif case==3:
-	path=input("Enter the complete file path: ")
-else:
-	print("Invalid input")
-
-with open(path) as json_file:
-	data = json.load(json_file)
-	print(data)
+	player,ratings_list=player_statistics(df_load_events,df_load_match)
+	player_rating_Df = spark.createDataFrame(ratings_list)
+	player=player.join(player_rating_Df,on=["playerId"],how="inner")
+	player.repartition(1).write.csv(path='hdfs://localhost:9000/SPARK/player_metrics.csv', mode="append")
+	#player.repartition(1).write.csv(path='hdfs://localhost:9000/SPARK/player_metrics.csv', mode="append")
+	#COMPUTING THE CHEMISTRY FOR ALL MATCHES
+	'''
+	chem=chemistry_coeff(player)
+	chem_df=spark.createDataFrame(chem)
+	chem_df.repartition(1).write.csv(path='hdfs://localhost:9000/SPARK/chemistry.csv', mode="append")
+	'''
+	
+	#ssc.start()
+	#ssc.awaitTermination()
 
