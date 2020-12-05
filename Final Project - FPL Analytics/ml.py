@@ -132,6 +132,6 @@ if(__name__=="__main__"):
 	print("r2: %f" % trainingSummary.r2)
 	lr_predictions = lr_model.transform(new_df)
     #to save
-    lr_model.save(sc, 'hdfs://localhost:9000/SPARK/)
+    lr_model.save(sc, 'hdfs://localhost:9000/SPARK/')
     #to load
     lr_model = LinearRegression.load(sc, 'hdfs://localhost:9000/SPARK/')
