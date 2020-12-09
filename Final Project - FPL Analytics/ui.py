@@ -1,19 +1,3 @@
-'''User Interface tasks
-The system must be able to undertake 3 tasks from the user. These tasks will in the form of
-reading a JSON file with a request and writing a JSON file with the response:
-1. Predicting match winning chances between 2 teams:
-a. Users can provide a date of a match and 2 teams of 11 players each
-b. System must ensure that the list of players have, as mentioned in the role field
-of the player’s data:
-1. 1 Goalkeeper (GK)
-2. At least 3 defenders (DF)
-3. At least 2 Mid fielders (MD)
-4. And at least 1 Forward (FW)
-c. Return Invalid team in case the above conditions are not met
-d. After regression make sure that the rating of any player is not below 0.2, if any
-player has a rating of less than 0.2, return that the player has retired
-e. If all conditions are met, return chance of either team winning the match
-'''
 #!usr/local/python3
 from pyspark import SparkConf, SparkContext
 from pyspark.streaming import StreamingContext
@@ -28,43 +12,29 @@ import re
 import pyspark.sql.functions as F
 from pyspark.sql.functions import col
 import json
-sc = SparkContext("local[2]", "FPL-notfromninad")
+from pyspark.sql import Row
+from pyspark.ml.regression import LinearRegression
+import datetime
+import csv
+from pyspark.ml.feature import VectorAssembler
+from pyspark.sql.functions import to_timestamp
+from pyspark.ml.regression import LinearRegression
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+import re
+import datetime
+
+
+sc = SparkContext("local[2]", "FPL")
 sqlContext = SQLContext(sc)
 ssc = StreamingContext(sc, 1)
-path=sys.argv[1]
-###################################################################
-def input_person(pid,predictions,chemistry_coeff,centers)
+spark = SparkSession.builder.appName('FPL').getOrCreate()
 
-        df_filtered=predictions.filter(predictions.playerId==pid)
 
-        if df_filtered.rdd.collect()[0].__getitem__("matchId") < 5 :
-            cluster=df_filtered.rdd.collect()[0].__getitem__("prediction")
-            values=centers[cluster]
-            same_cluster_peeps=predictions.filter(predictions.prediction==cluster)
-            average_coeff=0
-            same_cluster_peeps=same_cluster_peeps.rdd.collect()
-            for row in same_cluster_peeps:
-                pid2=row.__getitem__("playerId")
-                if pid > pid2:
-                    temp=pid2
-                    pid2=pid
-                    pid=temp
-                df_filtered=chemistry_coeff.filter((chemistry_coeff.player1 == pid ) & (chemistry_coeff.player2 == pid2 ))
-                average_coeff+=df_filtered.rdd.collect()[0].__getitem__("chemistry")
-            average_coeff/=len(same_cluster_peeps)
-            predictions=predictions.withColumn("CHEMISTRY",F.when(F.col("playerId") == pid,F.lit(average_coeff)).otherwise(F.col("CHEMISTRY")))
-            predictions=predictions.withColumn("RATING",F.when(F.col("playerId") == pid,F.lit(values[7])).otherwise(F.col("RATING")))
-#####################################################################################
-#path=input("Enter the complete file path: ")
-spark = SparkSession.builder.appName('abc').getOrCreate()
-player_csv= spark.read.csv('hdfs://localhost:9000/DATA/play.csv',inferSchema =True,header=True)
-predictions = spark.read.csv('hdfs://localhost:9000/SPARK/predictions.csv',inferSchema=True,header=True)
-new_player=predictions.join(player_csv, on = ["playerId"], how = "inner")
-new_player.show()
-with open('teams.csv', newline='') as f:
-    reader = csv.reader(f)
-    data = [tuple(row) for row in reader]
-print(data)
+
+
+############################################################################################################################################################
+#Helper function to check if valid team
 def check_team(l):
         gk=l.count('GK')
         df=l.count('DF')
@@ -74,8 +44,10 @@ def check_team(l):
                 return(1)
         else:
                 return(0)
-
-def predict_winning(data):
+#########################################################################################################################################################
+#Checks if given teams are valid, and if yes, goes further to retrive their winning chances
+def predict_winning(data,new_player):
+        print("IN PREDICT")
         match_date=data['date']
         team1=data["team1"]
         team2=data["team2"]
@@ -83,7 +55,7 @@ def predict_winning(data):
         r2=[]
         l1=[]
         l2=[]
-        p=new_player.rdd.collect()
+        p=player_csv.rdd.collect()
         team1name=team1["name"]
         team2name=team2["name"]
         del team1["name"]
@@ -93,171 +65,195 @@ def predict_winning(data):
                         #print(row.__getitem__("name"),i)
                         if(row.__getitem__("name")==i):
                                 r1.append(row.__getitem__("role"))
-                                l1.append(row.__getitem__("playerId"))
-
+                                l1.append(row.__getitem__("Id"))
         for i in team2.values():
                 for row in p:
                         #print(row.__getitem__("name"),i)
                         if(row.__getitem__("name")==i):
                                 r2.append(row.__getitem__("role"))
-                                l2.append(row.__getitem__("playerId"))
+                                l2.append(row.__getitem__("Id"))
         print(l1,l2)
         if(check_team(r1) and check_team(r2)):
-                print("TEAMS ARE ACCEPTED,perform regression now")
-                #player_csv = spark.read.csv('hdfs://localhost:9000/SPARK/players.csv',inferSchema=True,header=True)
-                #team_csv = spark.read.csv('hdfs://localhost:9000/SPARK/team.csv',inferSchema=True,header=True)
-
-                new_player=new_player.filter((predictions.playerId in l1) | (predictions.playerId in l2))
+                print("TEAMS ARE ACCEPTED")
+                p_collect=new_player.rdd.collect()
+                teamlist=[]
+                for row in p_collect:
+                        if (row.__getitem__("playerId") in l1) or  (row.__getitem__("playerId") in l2):
+                                teamlist.append(row)
+                rdd1 = sc.parallelize(teamlist)
+                test_df=rdd1.toDF()
+                test_df=test_df.withColumn("AGE",(F.datediff(F.lit(datetime.datetime.now()),F.col("birthDate"))/365)**2)
+                #new_player=new_player.filter((new_player.playerId in l1) | (new_player.playerId in l2))
                 #new_player=predictions.join(player_csv, on = ["playerId"], how = "inner")
-
-                if len(predictions.filter(new_player.matchId == 0).rdd.collect()) == 0:
+                df_1=new_player.filter(new_player.matchId == 0)
+                df_l=df_1.rdd.collect()                
+                if 0:
                     print("“error“:	 “Invalid	 Player”")
                 else:
-
-                    new_player=new_player.withColumn("AGE",(F.datediff(F.lit(match_date),F.col("birthDate"))/365)**2)
-                    lr_model = LinearRegression.load(sc,'hdfs://localhost:9000/SPARK/')
-                    lr_predictions = lr_model.transform(new_player)
-
-                    if len(lr_predictions.filter(lr_predictions.RATING < 0.2).rdd.collect()) != 0:
-                        print("Has retired players")
-                    else:
-                        strength1=0
-                        strength2=0
-                        team1=lr_predictions.filter(lr_predictions.playerId in l1)
-                        for row in team1.rdd.collect():
-                            strength1+=row.__getitem__("CHEMISTRY")*row.__getitem__("RATING")
-                        team2=lr_predictions.filter(lr_predictions.playerId in l2)
-                        for row in team2.rdd.collect():
-                            strength2+=row.__getitem__("CHEMISTRY")*row.__getitem__("RATING")
-                        strength1/=11
-                        strength2/=11
-                        chance_of_winningA=(0.5+strength1-((strength1+strength2)/2))*100
-                        chance_of_winningB=100-chance_of_winningA
-                        print("WINNING CHANCES of A and B",chance_of_winningA,chance_of_winningB)
-                        game=()
-                        game["team1"]={"name":team1name,"winning chance":int(chance_of_winningA)}
-                        game["team2"]={"name":team2name,"winning chance":int(chance_of_winningB)}
-
-                        with open('result'+str(strength1)+'.json', 'w') as fp:
-                            json.dump(game, fp)
-
-
-
+                        #new_player=new_player.withColumn("AGE",(F.datediff(F.lit(match_date),F.col("birthDate"))/365)**2)
+                        #new_player=predictions.join(player_csv,(predictions.playerId == player_csv.Id),how = "inner")
+                        new_player=new_player.withColumn("AGE",(F.datediff(F.lit(datetime.datetime.now()),F.col("birthDate"))/365)**2)
+                        new_player=new_player.drop("prediction")
+                        test_df=test_df.drop("prediction")
+                        new_player.show()
+                        vectorAssembler = VectorAssembler(inputCols = ['AGE'], outputCol = 'linear_features')
+                        new_df = vectorAssembler.transform(new_player)
+                        new_df.show()
+                        new_df = new_df.select(['linear_features', 'rating'])
+                        new_df.show()
+                        lr = LinearRegression(featuresCol = 'linear_features', labelCol='rating', maxIter=10, regParam=0.3, elasticNetParam=0.8)
+                        new_player.show()
+                        lr_model1 = lr.fit(new_df)
+                        trainingSummary = lr_model1.summary
+                        print("RMSE: %f" % trainingSummary.rootMeanSquaredError)
+                        print("r2: %f" % trainingSummary.r2)
+                        
+                        vectorAssembler = VectorAssembler(inputCols = ['AGE'], outputCol = 'linear_features')
+                        new_df = vectorAssembler.transform(test_df)
+                                                                                         
+                        lr_predictions = lr_model1.transform(new_df)
+                        lr_predictions.show()
+                        
+                        if len(lr_predictions.filter(lr_predictions.prediction < 0.2).rdd.collect()) != 0:
+                                print("Has retired players")
+                        else:
+                                strength1=0
+                                strength2=0
+                                p_collect=lr_predictions.rdd.collect()
+                                team1=[]
+                                team2=[]
+                                for row in p_collect:
+                                        if (row.__getitem__("playerId") in l1):
+                                                team1.append(row)
+                                        else:
+                                                team2.append(row)
+                    
+                                for row in team1:
+                                    strength1+=row.__getitem__("CHEMISTRY")*row.__getitem__("prediction")
+                                for row in team2:
+                                    strength2+=row.__getitem__("CHEMISTRY")*row.__getitem__("prediction")
+                                strength1/=11
+                                strength2/=11
+                                chance_of_winningA=(0.5+strength1-((strength1+strength2)/2))*100
+                                chance_of_winningB=100-chance_of_winningA
+                                print("WINNING CHANCES of A and B",chance_of_winningA,chance_of_winningB)
+                                game={}
+                                game["team1"]={"name":team1name,"winning chance":int(chance_of_winningA)}
+                                game["team2"]={"name":team2name,"winning chance":int(chance_of_winningB)}
+                                print("\n\n\n\n\nFINAL JSON O/P:\n\n")
+                                print(game)
+                                with open('result'+str(strength1)+'.json', 'w') as fp:
+                                        json.dump(game, fp)
+                        
         else:
                 print("Invalid team")
 
-
-
-
-def player_profile(data):
+#############################################################################################################################################################
+#Player profile - given player name, retrieves all relevant information about the player at the end of the tournament along with personal info ("IF the player has played")
+def player_profile(data,new_player):
         given_name=data['name']
         prof=dict()
         #IF ALL CALCULATED VALUES ADDED TO play.csv, read from that and display
         that_player=new_player.filter(new_player.name == given_name)
-        rec=that_player.rdd.collect()[0]
+        if(len(that_player.rdd.collect()!=0):
+                rec=that_player.rdd.collect()[0]
 
-        prof["name"]=rec.__getitem__("name")
-        prof["birthArea"]=rec.__getitem__("birthArea")
-        prof["birthDate"]=rec.__getitem__("birthDate")
-        prof["foot"]=rec.__getitem__("foot")
-        prof["role"]=rec.__getitem__("role")
-        prof["height"]=rec.__getitem__("height")
-        prof["passportArea"]=rec.__getitem__("passportArea")
-        prof["weight"]=rec.__getitem__("weight")
+                prof["name"]=rec.__getitem__("name")
+                prof["birthArea"]=rec.__getitem__("birthArea")
+                prof["birthDate"]=rec.__getitem__("birthDate")
+                prof["foot"]=rec.__getitem__("foot")
+                prof["role"]=rec.__getitem__("role")
+                prof["height"]=rec.__getitem__("height")
+                prof["passportArea"]=rec.__getitem__("passportArea")
+                prof["weight"]=rec.__getitem__("weight")
 
-        if rec.__getitem__("matchId") != 0:
-            prof["fouls"]=rec.__getitem__("fouls")
-            prof["goals"]=rec.__getitem__("goals")
-            prof["own_goals"]=rec.__getitem__("own_goals")
-            prof["percent_pass_accuracy"]=int(rec.__getitem__("pass_accuracy")*100)
-            prof["“percent_shots_on_target"]=int(rec.__getitem__("shot_effectiveness")*100)
+                if rec.__getitem__("matchId") != 0:
+                    prof["fouls"]=rec.__getitem__("fouls")
+                    #prof["goals"]=rec.__getitem__("goals")
+                    prof["own_goals"]=rec.__getitem__("own_goal")
+                    prof["pass_accuracy"]=rec.__getitem__("pass_accuracy")
+                    prof["shots_on_target"]=rec.__getitem__("shot_effectiveness")
+                print("Final Profile: ")
+                print(prof)
+                with open('result'+str(given_name)+'.json', 'w') as fp:
+                    json.dump(prof, fp)
+        else:
+                print("PLAYER NOT FOUND")
 
-        with open('result'+str(given_name)+'.json', 'w') as fp:
-            json.dump(prof, fp)
-
-
-
-
-def match_details(data):
+##############################################################################################################################################################
+#Match profile - given a match date, retrieves its information from the stored database obtained during streaming ("If exists")
+def match_details(data,teams_given):
         match_date=data['date']
         label=data["label"]
-        match_profile = spark.read.csv('hdfs://localhost:9000/SPARK/match_profile.csv',inferSchema=True,header=True)
+        match_profile = spark.read.csv('hdfs://localhost:9000/SPARK/match_profiles_wd2.csv',inferSchema=True,header=True)
         #match=dict()
-        match_profile=match_profile.withColumn("time",to_timestamp(F.col("time")))
+        match_profile=match_profile.withColumn("date",(F.col("date")[0:10]))
+        match_profile.show()
+        match_profile=match_profile.fillna(0)               
         deets=match_profile.filter(match_profile.date == match_date)
-        match=dict()
-        match["date"]=rec.__getitem__("date")
-        match["duration"]=rec.__getitem__("duration")
-        match["winner"]=rec.__getitem__("winner")
-        match["venue"]=rec.__getitem__("venue")
-        match["gameweek"]=rec.__getitem__("gameweek")
-        match["goals"]=[]
-        g=rec.__getitem__("goals")
-        for i in g.split("*"):
-            l=i.split("+")
-            if l[2] != '0':
-                match["goals"].append({"name":l[0],"team":l[1],"goals":l[2]})
+        print(match_date)
+        deets.show()
+        if(len(deets.rdd.collect()!=0):    
+                deets=deets.rdd.collect()[0]
+                print(deets)
+                match=dict()
+                match["date"]=match_date
+                match["duration"]=deets.__getitem__("duration")
+                match["winner"]=deets.__getitem__("winner")
+                match["venue"]=deets.__getitem__("venue")
+                match["gameweek"]=deets.__getitem__("gameweek")
+                match["goals"]=[]
+                g=deets.__getitem__("goals")
+                for i in g.split("*"):
+                    l=i.split("+")
+                    if l[2] != '0' and l[2]!='null':
+                        for i in teams_given:
+                                if(i[1]==l[1]):
+                                        team=i[1]
+                                else:
+                                        team=l[1]
+                        match["goals"].append({"name":l[0],"team":team,"goals":l[2]})
 
-        match["yellow_cards"]=rec.__getitem__("yellow_cards")
-        match["red_cards"]=rec.__getitem__("red_cards")
-        with open('result'+str(match_date)+'.json', 'w') as fp:
-            json.dump(prof, fp)
-
-
-
-        #RETURN DETAILS STUFF FROM MATCH PROFILE FILE
-
-
-with open(path) as json_file:
-        s = json_file.read()
-        s = s.replace('\t','')
-        s = s.replace('\n','')
-        s = s.replace(',}','}')
-        s = s.replace(',]',']')
-        data = json.loads(s)
-        #print(data)
-        #data = simplejson.load(json_file)
-        print(data)
-        request_type=data['req_type']
-        if(request_type==1):
-                predict_winning(data)
-        elif(request_path==2):
-                player_profile(data)
-        elif(request_type==3):
-                match_details(data)
-ssc.start()
-ssc.awaitTermination()
-
-
-
-
-####################### MATCH PROFILE############################################################################
-"""
-# NEED TO GET ALL CORRESPONDING TEAM NAMES AND PLAYER NAMES FROM play.csv and teams.csv - add below code to create data, and store on hadoop, read later
-def infer_match(events):
-        details={} #maybe add below stuff to this before writing
-        date=events['dateutc']
-        duration=events['duration']
-        winner= events["winner"]
-        if(winner==0):
-                winner=None
-        venue=events["venue"]
-        gameweek=events["gameweek"]
-        players=[]
-        yellow_card_players=[]
-        red_card_players=[]
-        own_goal_list=[]
-        goals_list=[]
-        for team in teamsData:
-                players=events['formation']['bench']
-                players.extend[events['formation']['bench']]
-                for i in players:
-                        if(i['redCards']!=0):
-                                red_card_players.append(i['playerId'])
-                        if(i['yellowCards']!=0):
-                                yellow_card_players.append(['playerId'])
-                        if(i['goals']!=0):
-                                goals_list.append((i['playerId'],team,i['goals']))
-                        if(i['ownGoals']!=0):
-                                own_goals_list.append((i['playerId'],team,i['goals']))
-       """
+                match["yellow_cards"]=deets.__getitem__("yellowcards")
+                match["red_cards"]=deets.__getitem__("redcards")
+                print("THE MATCH DETAILS ARE")
+                print(match)
+                with open('result'+str(match_date)+'.json', 'w') as fp:
+                        json.dump(match, fp)
+        else:
+                print("INVALID MATCH")
+###########################################################################################################################################################
+#MAIN Function
+if(__name__=="__main__"):
+        path=sys.argv[1]
+        player_csv= spark.read.csv('hdfs://localhost:9000/testing/data/players.csv',inferSchema =True,header=True)
+        predictions = spark.read.csv('hdfs://localhost:9000/testing/predictions.csv',inferSchema=True,header=True)
+        team_csv=spark.read.csv('hdfs://localhost:9000/testing/data/teams.csv',inferSchema=True,header=True)
+        new_player=predictions.join(player_csv,(predictions.playerId == player_csv.Id),how = "inner")
+        new_player.show()
+        with open(path) as json_file:
+                s = json_file.read()
+                s = s.replace('\t','')
+                s = s.replace('\n','')
+                s = s.replace(',}','}')
+                s = s.replace(',]',']')
+                data = json.loads(s)
+                print("INPUT DATA: ")
+                print(data)
+                
+                with open('/home/kavya/Documents/Final Project - FPL Analytics/teams.csv', newline='') as f:
+                        reader = csv.reader(f)
+                        teams_given = [tuple(row) for row in reader]
+                        print(teams_given)
+                try:
+                        req=data['req_type']
+                        if(req==1):
+                                predict_winning(data,new_player)
+                        elif(req==2):
+                                player_profile(data,new_player)
+                        elif(req==3):
+                                match_details(data,teams_given)
+                        else:
+                                print("Invalid Input")
+                except:
+                        match_details(data,teams_given)
